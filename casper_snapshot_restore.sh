@@ -15,12 +15,15 @@ CASPER_BASE_DIR="/var/lib/casper"
 VALIDATOR_KEYS_DIR="/etc/casper/validator_keys"
 WATCH_SECONDS=300
 WATCH_INTERVAL=30
+DEFAULT_KNOWN_PEER="135.181.17.229:35000"
+DEFAULT_PEER_SOURCE_URL="http://135.181.17.229:8888/status"
+USE_DEFAULT_PEERS="true"
 KNOWN_PEERS=()
 PEER_SOURCE_URL=""
-AUTO_PEERS=0
+AUTO_PEERS=8
 SNAPSHOT_HEIGHT=0
 BLOCK_HEIGHT=""
-TRUSTED_HASH_DEPTH=200
+TRUSTED_HASH_DEPTH=500
 TRUSTED_HASH_HEIGHT=""
 STALE_SNAPSHOT_WARN_BLOCKS=5000
 TOTAL_STEPS=12
@@ -63,7 +66,7 @@ Options:
   --rpc URL         RPC endpoint for fresh trusted hash.
                     Default: https://node.testnet.casper.network/rpc
   --trusted-depth N Use a block N blocks behind RPC head for trusted_hash.
-                    Default: 200. Use 0 to use the latest block.
+                    Default: 500. Use 0 to use the latest block.
   --trusted-height N
                     Use exact block height for trusted_hash.
   --known-peer HOST Add a known peer to config.toml, for example:
@@ -71,8 +74,9 @@ Options:
                     Can be used multiple times.
   --peer-source URL Read extra peers from a Casper /status endpoint, for example:
                     --peer-source http://135.181.17.229:8888/status
-  --auto-peers N    Add first N peers from --peer-source. Default: 8 when
-                    --peer-source is used.
+  --auto-peers N    Add first N peers from --peer-source. Default: 8.
+  --no-default-peers
+                    Do not add the bundled default peer/source.
   --watch-seconds N Watch initial node progress after start. Default: 300.
   --no-watch        Do not watch initial node progress after start.
   --keep-archive    Do not delete downloaded snapshot archive after restore.
@@ -84,6 +88,11 @@ Environment alternatives:
   SNAPSHOT_INDEX_URL=https://snapshot.kalia.network/
   CASPER_VERSION=2_2_2
   RPC_URL=https://node.testnet.casper.network/rpc
+
+Default peer behavior:
+  The script automatically adds 135.181.17.229:35000 and imports up to
+  8 peers from http://135.181.17.229:8888/status when reachable.
+  Use --no-default-peers to disable this.
 
 This script removes only /var/lib/casper/casper-node.
 It does not remove /etc/casper/validator_keys.
@@ -171,16 +180,19 @@ import_known_peers_from_source() {
   info "Reading up to ${AUTO_PEERS} peers from $PEER_SOURCE_URL"
 
   local imported=0
+  local source_json
   local peer
+
+  if ! source_json="$(curl -fsS --max-time 10 "$PEER_SOURCE_URL" 2>/dev/null)"; then
+    warn "Peer source is not reachable. Continuing with configured known peers only."
+    return 0
+  fi
+
   while IFS= read -r peer; do
     [[ -n "$peer" ]] || continue
     add_known_peer "$peer"
     imported=$((imported + 1))
-  done < <(
-    curl -fsS --max-time 10 "$PEER_SOURCE_URL" \
-    | jq -r '.peers[]?.address // empty' \
-    | head -n "$AUTO_PEERS"
-  )
+  done < <(printf '%s' "$source_json" | jq -r '.peers[]?.address // empty' | head -n "$AUTO_PEERS")
 
   if [[ "$imported" -gt 0 ]]; then
     ok "Imported ${imported} peer(s) from source"
@@ -342,6 +354,10 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$AUTO_PEERS" ]] || fail "--auto-peers needs a number."
       shift 2
       ;;
+    --no-default-peers)
+      USE_DEFAULT_PEERS="false"
+      shift
+      ;;
     --watch-seconds)
       WATCH_SECONDS="${2:-}"
       shift 2
@@ -374,8 +390,11 @@ done
 if [[ -n "$TRUSTED_HASH_HEIGHT" ]]; then
   [[ "$TRUSTED_HASH_HEIGHT" =~ ^[0-9]+$ ]] || fail "--trusted-height must be a number."
 fi
-if [[ -n "$PEER_SOURCE_URL" && "$AUTO_PEERS" -eq 0 ]]; then
-  AUTO_PEERS=8
+if [[ "$USE_DEFAULT_PEERS" == "true" ]]; then
+  add_known_peer "$DEFAULT_KNOWN_PEER"
+  if [[ -z "$PEER_SOURCE_URL" ]]; then
+    PEER_SOURCE_URL="$DEFAULT_PEER_SOURCE_URL"
+  fi
 fi
 if [[ "$WATCH_SECONDS" -eq 0 ]]; then
   TOTAL_STEPS=11
