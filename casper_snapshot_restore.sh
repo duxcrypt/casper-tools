@@ -13,7 +13,15 @@ DOWNLOAD_DIR="${HOME}"
 CASPER_DATA_DIR="/var/lib/casper/casper-node"
 CASPER_BASE_DIR="/var/lib/casper"
 VALIDATOR_KEYS_DIR="/etc/casper/validator_keys"
-TOTAL_STEPS=10
+WATCH_SECONDS=300
+WATCH_INTERVAL=30
+KNOWN_PEERS=()
+PEER_SOURCE_URL=""
+AUTO_PEERS=0
+SNAPSHOT_HEIGHT=0
+BLOCK_HEIGHT=""
+STALE_SNAPSHOT_WARN_BLOCKS=5000
+TOTAL_STEPS=12
 CURRENT_STEP=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -52,6 +60,15 @@ Options:
   --version VERSION Casper config version folder. Default: 2_2_2
   --rpc URL         RPC endpoint for fresh trusted hash.
                     Default: https://node.testnet.casper.network/rpc
+  --known-peer HOST Add a known peer to config.toml, for example:
+                    --known-peer 135.181.17.229:35000
+                    Can be used multiple times.
+  --peer-source URL Read extra peers from a Casper /status endpoint, for example:
+                    --peer-source http://135.181.17.229:8888/status
+  --auto-peers N    Add first N peers from --peer-source. Default: 8 when
+                    --peer-source is used.
+  --watch-seconds N Watch initial node progress after start. Default: 300.
+  --no-watch        Do not watch initial node progress after start.
   --keep-archive    Do not delete downloaded snapshot archive after restore.
   --yes             Run without interactive confirmation.
   -h, --help        Show this help.
@@ -104,12 +121,162 @@ show_plan() {
   printf '\n%sRestore plan%s\n' "$BOLD" "$RESET"
   line
   printf '  Snapshot       : %s\n' "$SNAPSHOT_URL"
+  if [[ "${SNAPSHOT_HEIGHT:-0}" != "0" ]]; then
+    printf '  Snapshot block : %s\n' "$SNAPSHOT_HEIGHT"
+  fi
   printf '  Archive path   : %s\n' "$SNAPSHOT_PATH"
   printf '  Config         : %s\n' "$CONFIG_FILE"
   printf '  Trusted hash   : fresh hash from %s\n' "$RPC_URL"
+  if [[ "${#KNOWN_PEERS[@]}" -gt 0 ]]; then
+    printf '  Extra peers    : %s\n' "${KNOWN_PEERS[*]}"
+  fi
+  if [[ -n "$PEER_SOURCE_URL" ]]; then
+    printf '  Peer source    : %s\n' "$PEER_SOURCE_URL"
+  fi
+  if [[ "$WATCH_SECONDS" -gt 0 ]]; then
+    printf '  Post-check     : %ss\n' "$WATCH_SECONDS"
+  else
+    printf '  Post-check     : disabled\n'
+  fi
   printf '  Will remove    : %s\n' "$CASPER_DATA_DIR"
   printf '  Will keep      : %s\n' "$VALIDATOR_KEYS_DIR"
   line
+}
+
+add_known_peer() {
+  local peer="$1"
+  local existing
+  [[ -n "$peer" ]] || return 0
+  for existing in "${KNOWN_PEERS[@]}"; do
+    [[ "$existing" == "$peer" ]] && return 0
+  done
+  KNOWN_PEERS+=("$peer")
+}
+
+import_known_peers_from_source() {
+  [[ -n "$PEER_SOURCE_URL" ]] || return 0
+  [[ "$AUTO_PEERS" -gt 0 ]] || return 0
+
+  info "Reading up to ${AUTO_PEERS} peers from $PEER_SOURCE_URL"
+
+  local imported=0
+  local peer
+  while IFS= read -r peer; do
+    [[ -n "$peer" ]] || continue
+    add_known_peer "$peer"
+    imported=$((imported + 1))
+  done < <(
+    curl -fsS --max-time 10 "$PEER_SOURCE_URL" \
+    | jq -r '.peers[]?.address // empty' \
+    | head -n "$AUTO_PEERS"
+  )
+
+  if [[ "$imported" -gt 0 ]]; then
+    ok "Imported ${imported} peer(s) from source"
+  else
+    warn "No peers were imported from peer source."
+  fi
+}
+
+update_known_peers() {
+  [[ "${#KNOWN_PEERS[@]}" -gt 0 ]] || return 0
+  command -v python3 >/dev/null || fail "python3 is required to edit known_addresses safely."
+
+  local known_peers_csv
+  known_peers_csv="$(IFS=,; printf '%s' "${KNOWN_PEERS[*]}")"
+
+  CONFIG_FILE="$CONFIG_FILE" KNOWN_PEERS_CSV="$known_peers_csv" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+config_path = Path(os.environ["CONFIG_FILE"])
+new_peers = [peer.strip() for peer in os.environ["KNOWN_PEERS_CSV"].split(",") if peer.strip()]
+text = config_path.read_text()
+lines = text.splitlines()
+
+updated = False
+for index, line in enumerate(lines):
+    if re.match(r"\s*known_addresses\s*=", line):
+        existing = re.findall(r"['\"]([^'\"]+)['\"]", line)
+        merged = []
+        for peer in new_peers + existing:
+            if peer not in merged:
+                merged.append(peer)
+        prefix = line.split("=", 1)[0].rstrip()
+        lines[index] = f"{prefix} = [" + ",".join(f"'{peer}'" for peer in merged) + "]"
+        updated = True
+        break
+
+if not updated:
+    lines.append("known_addresses = [" + ",".join(f"'{peer}'" for peer in new_peers) + "]")
+
+config_path.write_text("\n".join(lines) + "\n")
+PY
+
+  ok "known_addresses updated: ${KNOWN_PEERS[*]}"
+}
+
+watch_initial_progress() {
+  [[ "$WATCH_SECONDS" -gt 0 ]] || return 0
+
+  step "Watch initial sync"
+  info "Checking local node API every ${WATCH_INTERVAL}s for up to ${WATCH_SECONDS}s"
+
+  local end_time start_height height state peers restarts initial_restarts status_json saw_progress
+  end_time=$((SECONDS + WATCH_SECONDS))
+  start_height=""
+  saw_progress=0
+  initial_restarts="$(systemctl show casper-node-launcher -p NRestarts --value 2>/dev/null || echo 0)"
+
+  while [[ "$SECONDS" -lt "$end_time" ]]; do
+    if status_json="$(curl -fsS --max-time 5 http://127.0.0.1:8888/status 2>/dev/null)"; then
+      state="$(printf '%s' "$status_json" | jq -r '.reactor_state // "unknown"')"
+      height="$(printf '%s' "$status_json" | jq -r '.last_added_block_info.height // "unknown"')"
+      peers="$(printf '%s' "$status_json" | jq -r '(.peers // []) | length')"
+      restarts="$(systemctl show casper-node-launcher -p NRestarts --value 2>/dev/null || echo 0)"
+
+      printf '  - state=%s height=%s peers=%s restarts=%s\n' "$state" "$height" "$peers" "$restarts"
+
+      if [[ "$height" =~ ^[0-9]+$ ]]; then
+        if [[ -z "$start_height" ]]; then
+          start_height="$height"
+        elif [[ "$height" -gt "$start_height" ]]; then
+          saw_progress=1
+        fi
+      fi
+
+      if [[ "$restarts" != "$initial_restarts" ]]; then
+        warn "casper-node-launcher restarted during post-check."
+        initial_restarts="$restarts"
+      fi
+
+      if [[ "$state" == "Validate" ]]; then
+        ok "Node is validating."
+        return 0
+      fi
+
+      if [[ "$state" == "KeepUp" && "$peers" =~ ^[0-9]+$ && "$peers" -gt 0 ]]; then
+        ok "Node is keeping up with peers."
+        return 0
+      fi
+
+      if [[ "$state" == "CatchUp" && "$saw_progress" -eq 1 ]]; then
+        ok "Node is catching up and height is moving."
+        return 0
+      fi
+    else
+      warn "Node API is not ready yet."
+    fi
+
+    sleep "$WATCH_INTERVAL"
+  done
+
+  if [[ "$saw_progress" -eq 1 ]]; then
+    ok "Node made progress during post-check."
+  else
+    warn "No clear progress during post-check. If it stays in CatchUp, try a newer snapshot or add --known-peer."
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -139,6 +306,29 @@ while [[ $# -gt 0 ]]; do
       RPC_URL="${2:-}"
       shift 2
       ;;
+    --known-peer)
+      [[ -n "${2:-}" ]] || fail "--known-peer needs HOST, for example 135.181.17.229:35000"
+      add_known_peer "$2"
+      shift 2
+      ;;
+    --peer-source)
+      PEER_SOURCE_URL="${2:-}"
+      [[ -n "$PEER_SOURCE_URL" ]] || fail "--peer-source needs a URL, for example http://135.181.17.229:8888/status"
+      shift 2
+      ;;
+    --auto-peers)
+      AUTO_PEERS="${2:-}"
+      [[ -n "$AUTO_PEERS" ]] || fail "--auto-peers needs a number."
+      shift 2
+      ;;
+    --watch-seconds)
+      WATCH_SECONDS="${2:-}"
+      shift 2
+      ;;
+    --no-watch)
+      WATCH_SECONDS=0
+      shift
+      ;;
     --keep-archive)
       KEEP_ARCHIVE="true"
       shift
@@ -156,6 +346,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+[[ "$WATCH_SECONDS" =~ ^[0-9]+$ ]] || fail "--watch-seconds must be a number."
+[[ "$AUTO_PEERS" =~ ^[0-9]+$ ]] || fail "--auto-peers must be a number."
+if [[ -n "$PEER_SOURCE_URL" && "$AUTO_PEERS" -eq 0 ]]; then
+  AUTO_PEERS=8
+fi
+if [[ "$WATCH_SECONDS" -eq 0 ]]; then
+  TOTAL_STEPS=11
+fi
 
 SNAPSHOT_URL="${SNAPSHOT_URL:-${SNAPSHOT_URL:-}}"
 SNAPSHOT_INDEX_URL="${SNAPSHOT_INDEX_URL:-https://snapshot.kalia.network/}"
@@ -208,13 +407,16 @@ ok "Config found: $CONFIG_FILE"
 ok "Validator keys found: $VALIDATOR_KEYS_DIR"
 
 step "Install required tools"
-info "Installing aria2, lz4, jq, curl and tar if needed"
+info "Installing aria2, lz4, jq, curl, python3 and tar if needed"
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 lz4 jq curl ca-certificates tar grep sed coreutils
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 lz4 jq curl ca-certificates tar grep sed coreutils python3
 ok "Required tools are ready"
+import_known_peers_from_source
 
 SNAPSHOT_FILE="${SNAPSHOT_URL##*/}"
 SNAPSHOT_PATH="${DOWNLOAD_DIR}/${SNAPSHOT_FILE}"
+SNAPSHOT_HEIGHT="$(printf '%s\n' "$SNAPSHOT_FILE" | grep -Eo '[0-9]+' | tail -n 1 || true)"
+SNAPSHOT_HEIGHT="${SNAPSHOT_HEIGHT:-0}"
 
 show_plan
 
@@ -269,9 +471,10 @@ fi
 ok "Permissions fixed"
 
 step "Update trusted hash"
-info "Fetching latest block hash from $RPC_URL"
+info "Fetching latest block from $RPC_URL"
+BLOCK_JSON="$(casper-client get-block --node-address "$RPC_URL")"
 BLOCK_HASH="$(
-  casper-client get-block --node-address "$RPC_URL" \
+  printf '%s' "$BLOCK_JSON" \
   | jq -r '
       .result.block_with_signatures.block.Version2.hash //
       .result.block_with_signatures.block.Version1.hash //
@@ -280,8 +483,29 @@ BLOCK_HASH="$(
     ' \
   | tr -d '\n'
 )"
+BLOCK_HEIGHT="$(
+  printf '%s' "$BLOCK_JSON" \
+  | jq -r '
+      .result.block_with_signatures.block.Version2.header.height //
+      .result.block_with_signatures.block.Version1.header.height //
+      .result.block.header.height //
+      empty
+    ' \
+  | tr -d '\n'
+)"
 
 [[ -n "$BLOCK_HASH" && "$BLOCK_HASH" != "null" ]] || fail "Could not fetch trusted hash from $RPC_URL"
+
+if [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ && "$BLOCK_HEIGHT" =~ ^[0-9]+$ && "$SNAPSHOT_HEIGHT" -gt 0 ]]; then
+  SNAPSHOT_GAP=$((BLOCK_HEIGHT - SNAPSHOT_HEIGHT))
+  if [[ "$SNAPSHOT_GAP" -lt 0 ]]; then
+    warn "RPC height is lower than snapshot height. Check that both are Casper testnet."
+  elif [[ "$SNAPSHOT_GAP" -gt "$STALE_SNAPSHOT_WARN_BLOCKS" ]]; then
+    warn "Snapshot is ${SNAPSHOT_GAP} blocks behind RPC. CatchUp can take longer."
+  else
+    ok "Snapshot gap to RPC: ${SNAPSHOT_GAP} blocks"
+  fi
+fi
 
 if grep -q '^trusted_hash = ' "$CONFIG_FILE"; then
   sed -i "s/^trusted_hash = .*/trusted_hash = '${BLOCK_HASH}'/" "$CONFIG_FILE"
@@ -289,6 +513,7 @@ else
   sed -i "1itrusted_hash = '${BLOCK_HASH}'" "$CONFIG_FILE"
 fi
 ok "trusted_hash updated: $BLOCK_HASH"
+update_known_peers
 
 step "Start services and show status"
 systemctl start casper-node-launcher
@@ -313,6 +538,8 @@ if curl -fsS --max-time 5 http://127.0.0.1:8888/status >/tmp/casper-status.json;
 else
   warn "Node API is not ready yet. This can be normal right after start."
 fi
+
+watch_initial_progress
 
 if [[ "$KEEP_ARCHIVE" != "true" ]]; then
   printf '\n%sCleanup%s\n' "$BOLD" "$RESET"
