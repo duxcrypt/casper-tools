@@ -20,6 +20,8 @@ PEER_SOURCE_URL=""
 AUTO_PEERS=0
 SNAPSHOT_HEIGHT=0
 BLOCK_HEIGHT=""
+TRUSTED_HASH_DEPTH=200
+TRUSTED_HASH_HEIGHT=""
 STALE_SNAPSHOT_WARN_BLOCKS=5000
 TOTAL_STEPS=12
 CURRENT_STEP=0
@@ -60,6 +62,10 @@ Options:
   --version VERSION Casper config version folder. Default: 2_2_2
   --rpc URL         RPC endpoint for fresh trusted hash.
                     Default: https://node.testnet.casper.network/rpc
+  --trusted-depth N Use a block N blocks behind RPC head for trusted_hash.
+                    Default: 200. Use 0 to use the latest block.
+  --trusted-height N
+                    Use exact block height for trusted_hash.
   --known-peer HOST Add a known peer to config.toml, for example:
                     --known-peer 135.181.17.229:35000
                     Can be used multiple times.
@@ -127,6 +133,11 @@ show_plan() {
   printf '  Archive path   : %s\n' "$SNAPSHOT_PATH"
   printf '  Config         : %s\n' "$CONFIG_FILE"
   printf '  Trusted hash   : fresh hash from %s\n' "$RPC_URL"
+  if [[ -n "$TRUSTED_HASH_HEIGHT" ]]; then
+    printf '  Trusted height : %s\n' "$TRUSTED_HASH_HEIGHT"
+  else
+    printf '  Trusted depth  : %s block(s) behind RPC head\n' "$TRUSTED_HASH_DEPTH"
+  fi
   if [[ "${#KNOWN_PEERS[@]}" -gt 0 ]]; then
     printf '  Extra peers    : %s\n' "${KNOWN_PEERS[*]}"
   fi
@@ -306,6 +317,16 @@ while [[ $# -gt 0 ]]; do
       RPC_URL="${2:-}"
       shift 2
       ;;
+    --trusted-depth)
+      TRUSTED_HASH_DEPTH="${2:-}"
+      [[ -n "$TRUSTED_HASH_DEPTH" ]] || fail "--trusted-depth needs a number."
+      shift 2
+      ;;
+    --trusted-height)
+      TRUSTED_HASH_HEIGHT="${2:-}"
+      [[ -n "$TRUSTED_HASH_HEIGHT" ]] || fail "--trusted-height needs a block height."
+      shift 2
+      ;;
     --known-peer)
       [[ -n "${2:-}" ]] || fail "--known-peer needs HOST, for example 135.181.17.229:35000"
       add_known_peer "$2"
@@ -349,6 +370,10 @@ done
 
 [[ "$WATCH_SECONDS" =~ ^[0-9]+$ ]] || fail "--watch-seconds must be a number."
 [[ "$AUTO_PEERS" =~ ^[0-9]+$ ]] || fail "--auto-peers must be a number."
+[[ "$TRUSTED_HASH_DEPTH" =~ ^[0-9]+$ ]] || fail "--trusted-depth must be a number."
+if [[ -n "$TRUSTED_HASH_HEIGHT" ]]; then
+  [[ "$TRUSTED_HASH_HEIGHT" =~ ^[0-9]+$ ]] || fail "--trusted-height must be a number."
+fi
 if [[ -n "$PEER_SOURCE_URL" && "$AUTO_PEERS" -eq 0 ]]; then
   AUTO_PEERS=8
 fi
@@ -471,8 +496,32 @@ fi
 ok "Permissions fixed"
 
 step "Update trusted hash"
-info "Fetching latest block from $RPC_URL"
-BLOCK_JSON="$(casper-client get-block --node-address "$RPC_URL")"
+info "Fetching RPC head from $RPC_URL"
+HEAD_BLOCK_JSON="$(casper-client get-block --node-address "$RPC_URL")"
+HEAD_BLOCK_HEIGHT="$(
+  printf '%s' "$HEAD_BLOCK_JSON" \
+  | jq -r '
+      .result.block_with_signatures.block.Version2.header.height //
+      .result.block_with_signatures.block.Version1.header.height //
+      .result.block.header.height //
+      empty
+    ' \
+  | tr -d '\n'
+)"
+
+[[ "$HEAD_BLOCK_HEIGHT" =~ ^[0-9]+$ ]] || fail "Could not fetch RPC head height from $RPC_URL"
+
+if [[ -n "$TRUSTED_HASH_HEIGHT" ]]; then
+  TARGET_BLOCK_HEIGHT="$TRUSTED_HASH_HEIGHT"
+elif [[ "$TRUSTED_HASH_DEPTH" -gt 0 ]]; then
+  TARGET_BLOCK_HEIGHT=$((HEAD_BLOCK_HEIGHT - TRUSTED_HASH_DEPTH))
+  [[ "$TARGET_BLOCK_HEIGHT" -gt 0 ]] || fail "Trusted hash depth is too large for RPC head height."
+else
+  TARGET_BLOCK_HEIGHT="$HEAD_BLOCK_HEIGHT"
+fi
+
+info "Fetching trusted block at height $TARGET_BLOCK_HEIGHT (RPC head: $HEAD_BLOCK_HEIGHT)"
+BLOCK_JSON="$(casper-client get-block --node-address "$RPC_URL" --block-identifier "$TARGET_BLOCK_HEIGHT")"
 BLOCK_HASH="$(
   printf '%s' "$BLOCK_JSON" \
   | jq -r '
