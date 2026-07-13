@@ -13,6 +13,26 @@ DOWNLOAD_DIR="${HOME}"
 CASPER_DATA_DIR="/var/lib/casper/casper-node"
 CASPER_BASE_DIR="/var/lib/casper"
 VALIDATOR_KEYS_DIR="/etc/casper/validator_keys"
+TOTAL_STEPS=10
+CURRENT_STEP=0
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  BOLD="$(printf '\033[1m')"
+  DIM="$(printf '\033[2m')"
+  GREEN="$(printf '\033[32m')"
+  YELLOW="$(printf '\033[33m')"
+  BLUE="$(printf '\033[36m')"
+  RED="$(printf '\033[31m')"
+  RESET="$(printf '\033[0m')"
+else
+  BOLD=""
+  DIM=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  RED=""
+  RESET=""
+fi
 
 usage() {
   cat <<'EOF'
@@ -47,13 +67,49 @@ It does not remove /etc/casper/validator_keys.
 EOF
 }
 
-log() {
-  printf '\n[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+line() {
+  printf '%s\n' '------------------------------------------------------------'
+}
+
+banner() {
+  printf '\n%sCasper Testnet Snapshot Restore%s\n' "$BOLD" "$RESET"
+  line
+  printf 'This script replaces only the Casper chain database.\n'
+  printf 'Validator keys are checked and kept in place.\n'
+}
+
+step() {
+  CURRENT_STEP=$((CURRENT_STEP + 1))
+  printf '\n%s[%02d/%02d]%s %s%s%s\n' "$BLUE" "$CURRENT_STEP" "$TOTAL_STEPS" "$RESET" "$BOLD" "$*" "$RESET"
+}
+
+info() {
+  printf '  %s-%s %s\n' "$DIM" "$RESET" "$*"
+}
+
+ok() {
+  printf '  %sOK%s %s\n' "$GREEN" "$RESET" "$*"
+}
+
+warn() {
+  printf '  %sWARN%s %s\n' "$YELLOW" "$RESET" "$*"
 }
 
 fail() {
-  echo "ERROR: $*" >&2
+  printf '\n%sERROR%s %s\n' "$RED" "$RESET" "$*" >&2
   exit 1
+}
+
+show_plan() {
+  printf '\n%sRestore plan%s\n' "$BOLD" "$RESET"
+  line
+  printf '  Snapshot       : %s\n' "$SNAPSHOT_URL"
+  printf '  Archive path   : %s\n' "$SNAPSHOT_PATH"
+  printf '  Config         : %s\n' "$CONFIG_FILE"
+  printf '  Trusted hash   : fresh hash from %s\n' "$RPC_URL"
+  printf '  Will remove    : %s\n' "$CASPER_DATA_DIR"
+  printf '  Will keep      : %s\n' "$VALIDATOR_KEYS_DIR"
+  line
 }
 
 while [[ $# -gt 0 ]]; do
@@ -106,13 +162,17 @@ SNAPSHOT_INDEX_URL="${SNAPSHOT_INDEX_URL:-https://snapshot.kalia.network/}"
 CASPER_VERSION="${CASPER_VERSION:-2_2_2}"
 RPC_URL="${RPC_URL:-https://node.testnet.casper.network/rpc}"
 CONFIG_FILE="/etc/casper/${CASPER_VERSION}/config.toml"
+STARTED_AT="$(date +%s)"
+
+banner
 
 if [[ "$LATEST" == "true" ]]; then
   command -v curl >/dev/null || fail "curl is required for --latest."
   command -v grep >/dev/null || fail "grep is required for --latest."
   command -v sed >/dev/null || fail "sed is required for --latest."
   command -v sort >/dev/null || fail "sort is required for --latest."
-  log "Detecting latest snapshot from $SNAPSHOT_INDEX_URL"
+  step "Find latest snapshot"
+  info "Reading $SNAPSHOT_INDEX_URL"
   SNAPSHOT_URL="$(
     curl -fsSL "$SNAPSHOT_INDEX_URL" \
     | grep -Eo 'https?://[^"'"'"' <>()]+/snapshots/casper/casper-test-[0-9]+\.tar\.lz4|/snapshots/casper/casper-test-[0-9]+\.tar\.lz4|casper-test-[0-9]+\.tar\.lz4' \
@@ -121,6 +181,8 @@ if [[ "$LATEST" == "true" ]]; then
     | sort -V \
     | tail -n 1
   )"
+  [[ -n "$SNAPSHOT_URL" ]] || fail "Could not detect a snapshot from $SNAPSHOT_INDEX_URL"
+  ok "Latest snapshot: $SNAPSHOT_URL"
 fi
 
 if [[ "$PRINT_LATEST" == "true" ]]; then
@@ -136,58 +198,70 @@ fi
 [[ -f "$VALIDATOR_KEYS_DIR/public_key.pem" ]] || fail "Missing validator public key: $VALIDATOR_KEYS_DIR/public_key.pem"
 [[ -n "$SNAPSHOT_URL" ]] || fail "Missing --url SNAPSHOT_URL, or --latest could not detect a snapshot."
 
-log "Installing required tools"
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y aria2 lz4 jq curl ca-certificates tar grep sed coreutils
+if [[ "$LATEST" != "true" ]]; then
+  step "Use provided snapshot"
+  ok "$SNAPSHOT_URL"
+fi
+
+step "Check node files"
+ok "Config found: $CONFIG_FILE"
+ok "Validator keys found: $VALIDATOR_KEYS_DIR"
+
+step "Install required tools"
+info "Installing aria2, lz4, jq, curl and tar if needed"
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 lz4 jq curl ca-certificates tar grep sed coreutils
+ok "Required tools are ready"
 
 SNAPSHOT_FILE="${SNAPSHOT_URL##*/}"
 SNAPSHOT_PATH="${DOWNLOAD_DIR}/${SNAPSHOT_FILE}"
 
-cat <<EOF
-
-Casper snapshot restore plan:
-  Snapshot:       $SNAPSHOT_URL
-  Archive path:   $SNAPSHOT_PATH
-  Config:         $CONFIG_FILE
-  RPC hash source:$RPC_URL
-  Remove data:    $CASPER_DATA_DIR
-  Keep keys:      $VALIDATOR_KEYS_DIR
-
-EOF
+show_plan
 
 if [[ "$YES" != "true" ]]; then
   read -r -p "Type RESTORE to stop services and replace Casper DB: " answer
   [[ "$answer" == "RESTORE" ]] || fail "Cancelled."
 fi
 
-log "Downloading snapshot"
-aria2c --continue=true --max-connection-per-server=16 --split=16 --min-split-size=1M \
+step "Download snapshot"
+info "This can take a while on a fresh node"
+aria2c --continue=true --max-connection-per-server=16 --split=16 --min-split-size=1M --summary-interval=10 \
   --dir="$DOWNLOAD_DIR" --out="$SNAPSHOT_FILE" "$SNAPSHOT_URL"
 
 [[ -s "$SNAPSHOT_PATH" ]] || fail "Snapshot download failed or file is empty: $SNAPSHOT_PATH"
+ok "Snapshot archive is ready: $SNAPSHOT_PATH"
 
-log "Stopping Casper services"
+step "Stop Casper services"
 systemctl stop casper-node-launcher casper-sidecar 2>/dev/null || true
 sleep 2
+ok "Casper services stopped"
 
-log "Backing up config"
-cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.snapshot.$(date '+%Y%m%d-%H%M%S')"
+step "Back up config"
+CONFIG_BACKUP="${CONFIG_FILE}.bak.snapshot.$(date '+%Y%m%d-%H%M%S')"
+cp "$CONFIG_FILE" "$CONFIG_BACKUP"
+ok "Config backup: $CONFIG_BACKUP"
 
-log "Removing old Casper chain data"
+step "Replace old chain database"
+warn "Removing old data directory: $CASPER_DATA_DIR"
 rm -rf "$CASPER_DATA_DIR"
+ok "Old chain data removed"
 
-log "Extracting snapshot"
+step "Extract snapshot"
+info "Writing snapshot into $CASPER_BASE_DIR"
 lz4 -d -c "$SNAPSHOT_PATH" | tar -x -C "$CASPER_BASE_DIR"
 
 [[ -d "$CASPER_DATA_DIR" ]] || fail "Snapshot did not create expected directory: $CASPER_DATA_DIR"
+ok "Snapshot extracted"
 
-log "Fixing ownership and permissions"
+step "Fix permissions"
 chown -R casper:casper "$CASPER_DATA_DIR"
 if [[ -x /etc/casper/node_util.py ]]; then
   /etc/casper/node_util.py fix_permissions || true
 fi
+ok "Permissions fixed"
 
-log "Fetching fresh trusted hash"
+step "Update trusted hash"
+info "Fetching latest block hash from $RPC_URL"
 BLOCK_HASH="$(
   casper-client get-block --node-address "$RPC_URL" \
   | jq -r '
@@ -201,23 +275,25 @@ BLOCK_HASH="$(
 
 [[ -n "$BLOCK_HASH" && "$BLOCK_HASH" != "null" ]] || fail "Could not fetch trusted hash from $RPC_URL"
 
-log "Updating trusted_hash in config.toml"
 if grep -q '^trusted_hash = ' "$CONFIG_FILE"; then
   sed -i "s/^trusted_hash = .*/trusted_hash = '${BLOCK_HASH}'/" "$CONFIG_FILE"
 else
   sed -i "1itrusted_hash = '${BLOCK_HASH}'" "$CONFIG_FILE"
 fi
+ok "trusted_hash updated: $BLOCK_HASH"
 
-log "Starting Casper services"
+step "Start services and show status"
 systemctl start casper-node-launcher
 systemctl start casper-sidecar 2>/dev/null || true
 sleep 10
 
-log "Service status"
-systemctl --no-pager --full status casper-node-launcher | sed -n '1,18p' || true
-systemctl is-active casper-sidecar 2>/dev/null || true
+LAUNCHER_STATUS="$(systemctl is-active casper-node-launcher 2>/dev/null || true)"
+SIDECAR_STATUS="$(systemctl is-active casper-sidecar 2>/dev/null || true)"
+printf '  casper-node-launcher : %s\n' "${LAUNCHER_STATUS:-unknown}"
+printf '  casper-sidecar       : %s\n' "${SIDECAR_STATUS:-unknown}"
 
-log "Node status"
+printf '\n%sNode status%s\n' "$BOLD" "$RESET"
+line
 if curl -fsS --max-time 5 http://127.0.0.1:8888/status >/tmp/casper-status.json; then
   jq -r '
     "reactor_state: \(.reactor_state)",
@@ -227,15 +303,22 @@ if curl -fsS --max-time 5 http://127.0.0.1:8888/status >/tmp/casper-status.json;
   ' /tmp/casper-status.json
   echo "trusted_hash: $BLOCK_HASH"
 else
-  echo "Node API is not ready yet. Watch logs with:"
-  echo "  /etc/casper/node_util.py watch"
+  warn "Node API is not ready yet. This can be normal right after start."
 fi
 
 if [[ "$KEEP_ARCHIVE" != "true" ]]; then
-  log "Removing downloaded archive"
+  printf '\n%sCleanup%s\n' "$BOLD" "$RESET"
+  line
   rm -f "$SNAPSHOT_PATH"
+  ok "Removed downloaded archive"
+else
+  warn "Archive kept: $SNAPSHOT_PATH"
 fi
 
-log "Done"
+FINISHED_AT="$(date +%s)"
+DURATION=$((FINISHED_AT - STARTED_AT))
+printf '\n%sDone%s\n' "$BOLD" "$RESET"
+line
+ok "Snapshot restore finished in ${DURATION}s"
 echo "Follow sync:"
 echo "  /etc/casper/node_util.py watch"
