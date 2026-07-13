@@ -224,8 +224,16 @@ if [[ "$YES" != "true" ]]; then
 fi
 
 step "Download snapshot"
-info "This can take a while on a fresh node"
-aria2c --continue=true --max-connection-per-server=16 --split=16 --min-split-size=1M --summary-interval=10 \
+info "Downloading quietly. Large snapshots can take a few minutes."
+aria2c \
+  --continue=true \
+  --max-connection-per-server=16 \
+  --split=16 \
+  --min-split-size=1M \
+  --summary-interval=0 \
+  --console-log-level=warn \
+  --show-console-readout=false \
+  --download-result=hide \
   --dir="$DOWNLOAD_DIR" --out="$SNAPSHOT_FILE" "$SNAPSHOT_URL"
 
 [[ -s "$SNAPSHOT_PATH" ]] || fail "Snapshot download failed or file is empty: $SNAPSHOT_PATH"
