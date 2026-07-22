@@ -23,7 +23,7 @@ PEER_SOURCE_URL=""
 AUTO_PEERS=8
 SNAPSHOT_HEIGHT=0
 BLOCK_HEIGHT=""
-TRUSTED_HASH_DEPTH=500
+TRUSTED_HASH_DEPTH=0
 TRUSTED_HASH_HEIGHT=""
 STALE_SNAPSHOT_WARN_BLOCKS=5000
 TOTAL_STEPS=12
@@ -66,7 +66,7 @@ Options:
   --rpc URL         RPC endpoint for fresh trusted hash.
                     Default: https://node.testnet.casper.network/rpc
   --trusted-depth N Use a block N blocks behind RPC head for trusted_hash.
-                    Default: 500. Use 0 to use the latest block.
+                    Default: 0, which uses the latest RPC head block.
   --trusted-height N
                     Use exact block height for trusted_hash.
   --known-peer HOST Add a known peer to config.toml, for example:
@@ -145,7 +145,11 @@ show_plan() {
   if [[ -n "$TRUSTED_HASH_HEIGHT" ]]; then
     printf '  Trusted height : %s\n' "$TRUSTED_HASH_HEIGHT"
   else
-    printf '  Trusted depth  : %s block(s) behind RPC head\n' "$TRUSTED_HASH_DEPTH"
+    if [[ "$TRUSTED_HASH_DEPTH" -gt 0 ]]; then
+      printf '  Trusted depth  : %s block(s) behind RPC head\n' "$TRUSTED_HASH_DEPTH"
+    else
+      printf '  Trusted height : latest RPC head\n'
+    fi
   fi
   if [[ "${#KNOWN_PEERS[@]}" -gt 0 ]]; then
     printf '  Extra peers    : %s\n' "${KNOWN_PEERS[*]}"
@@ -238,6 +242,46 @@ config_path.write_text("\n".join(lines) + "\n")
 PY
 
   ok "known_addresses updated: ${KNOWN_PEERS[*]}"
+}
+
+update_trusted_hash() {
+  command -v python3 >/dev/null || fail "python3 is required to edit trusted_hash safely."
+
+  CONFIG_FILE="$CONFIG_FILE" BLOCK_HASH="$BLOCK_HASH" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+config_path = Path(os.environ["CONFIG_FILE"])
+block_hash = os.environ["BLOCK_HASH"]
+lines = config_path.read_text().splitlines()
+
+node_start = None
+node_end = len(lines)
+for index, line in enumerate(lines):
+    if re.match(r"\s*\[node\]\s*$", line):
+        node_start = index
+        continue
+    if node_start is not None and index > node_start and re.match(r"\s*\[[^\]]+\]\s*$", line):
+        node_end = index
+        break
+
+if node_start is None:
+    raise SystemExit("Could not find [node] section in config.toml")
+
+replacement = f"trusted_hash = '{block_hash}'"
+for index in range(node_start + 1, node_end):
+    if re.match(r"\s*#?\s*trusted_hash\s*=", lines[index]):
+        indent = re.match(r"^(\s*)", lines[index]).group(1)
+        lines[index] = indent + replacement
+        break
+else:
+    lines.insert(node_start + 1, replacement)
+
+config_path.write_text("\n".join(lines) + "\n")
+PY
+
+  ok "trusted_hash updated: $BLOCK_HASH"
 }
 
 watch_initial_progress() {
@@ -459,7 +503,7 @@ import_known_peers_from_source
 
 SNAPSHOT_FILE="${SNAPSHOT_URL##*/}"
 SNAPSHOT_PATH="${DOWNLOAD_DIR}/${SNAPSHOT_FILE}"
-SNAPSHOT_HEIGHT="$(printf '%s\n' "$SNAPSHOT_FILE" | grep -Eo '[0-9]+' | tail -n 1 || true)"
+SNAPSHOT_HEIGHT="$(printf '%s\n' "$SNAPSHOT_FILE" | sed -n 's/^casper-test-\([0-9][0-9]*\)\.tar\.lz4$/\1/p')"
 SNAPSHOT_HEIGHT="${SNAPSHOT_HEIGHT:-0}"
 
 show_plan
@@ -535,6 +579,10 @@ if [[ -n "$TRUSTED_HASH_HEIGHT" ]]; then
 elif [[ "$TRUSTED_HASH_DEPTH" -gt 0 ]]; then
   TARGET_BLOCK_HEIGHT=$((HEAD_BLOCK_HEIGHT - TRUSTED_HASH_DEPTH))
   [[ "$TARGET_BLOCK_HEIGHT" -gt 0 ]] || fail "Trusted hash depth is too large for RPC head height."
+  if [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ && "$SNAPSHOT_HEIGHT" -gt 0 && "$HEAD_BLOCK_HEIGHT" -gt "$SNAPSHOT_HEIGHT" && "$TARGET_BLOCK_HEIGHT" -le "$SNAPSHOT_HEIGHT" ]]; then
+    warn "Snapshot is newer than head-${TRUSTED_HASH_DEPTH}; using latest RPC head for trusted_hash instead."
+    TARGET_BLOCK_HEIGHT="$HEAD_BLOCK_HEIGHT"
+  fi
 else
   TARGET_BLOCK_HEIGHT="$HEAD_BLOCK_HEIGHT"
 fi
@@ -575,12 +623,7 @@ if [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ && "$BLOCK_HEIGHT" =~ ^[0-9]+$ && "$SNAPSHO
   fi
 fi
 
-if grep -q '^trusted_hash = ' "$CONFIG_FILE"; then
-  sed -i "s/^trusted_hash = .*/trusted_hash = '${BLOCK_HASH}'/" "$CONFIG_FILE"
-else
-  sed -i "1itrusted_hash = '${BLOCK_HASH}'" "$CONFIG_FILE"
-fi
-ok "trusted_hash updated: $BLOCK_HASH"
+update_trusted_hash
 update_known_peers
 
 step "Start services and show status"
