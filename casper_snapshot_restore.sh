@@ -26,7 +26,7 @@ BLOCK_HEIGHT=""
 TRUSTED_HASH_DEPTH=0
 TRUSTED_HASH_HEIGHT=""
 STALE_SNAPSHOT_WARN_BLOCKS=5000
-TOTAL_STEPS=12
+TOTAL_STEPS=13
 CURRENT_STEP=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -222,21 +222,35 @@ new_peers = [peer.strip() for peer in os.environ["KNOWN_PEERS_CSV"].split(",") i
 text = config_path.read_text()
 lines = text.splitlines()
 
-updated = False
+network_start = None
+network_end = len(lines)
 for index, line in enumerate(lines):
-    if re.match(r"\s*known_addresses\s*=", line):
+    if re.match(r"\s*\[network\]\s*$", line):
+        network_start = index
+        continue
+    if network_start is not None and index > network_start and re.match(r"\s*\[[^\]]+\]\s*$", line):
+        network_end = index
+        break
+
+if network_start is None:
+    raise SystemExit("Could not find [network] section in config.toml")
+
+updated = False
+for index in range(network_start + 1, network_end):
+    line = lines[index]
+    if re.match(r"\s*#?\s*known_addresses\s*=", line):
         existing = re.findall(r"['\"]([^'\"]+)['\"]", line)
         merged = []
         for peer in new_peers + existing:
             if peer not in merged:
                 merged.append(peer)
-        prefix = line.split("=", 1)[0].rstrip()
-        lines[index] = f"{prefix} = [" + ",".join(f"'{peer}'" for peer in merged) + "]"
+        indent = re.match(r"^(\s*)", line).group(1)
+        lines[index] = f"{indent}known_addresses = [" + ",".join(f"'{peer}'" for peer in merged) + "]"
         updated = True
         break
 
 if not updated:
-    lines.append("known_addresses = [" + ",".join(f"'{peer}'" for peer in new_peers) + "]")
+    lines.insert(network_start + 1, "known_addresses = [" + ",".join(f"'{peer}'" for peer in new_peers) + "]")
 
 config_path.write_text("\n".join(lines) + "\n")
 PY
@@ -282,6 +296,86 @@ config_path.write_text("\n".join(lines) + "\n")
 PY
 
   ok "trusted_hash updated: $BLOCK_HASH"
+}
+
+check_config_health() {
+  command -v python3 >/dev/null || fail "python3 is required to check config.toml safely."
+
+  CONFIG_FILE="$CONFIG_FILE" python3 - <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+config_path = Path(os.environ["CONFIG_FILE"])
+lines = config_path.read_text().splitlines()
+
+cleaned = []
+misplaced_trusted_hash_lines = []
+seen_section = False
+for line_number, line in enumerate(lines, 1):
+    if re.match(r"\s*\[[^\]]+\]\s*$", line):
+        seen_section = True
+    if not seen_section and re.match(r"\s*trusted_hash\s*=", line):
+        misplaced_trusted_hash_lines.append(line_number)
+        continue
+    cleaned.append(line)
+
+if misplaced_trusted_hash_lines:
+    config_path.write_text("\n".join(cleaned) + "\n")
+    lines = cleaned
+    print(
+        "Removed misplaced top-level trusted_hash line(s): "
+        + ", ".join(str(item) for item in misplaced_trusted_hash_lines)
+    )
+
+sections = set()
+for line in lines:
+    match = re.match(r"\s*\[([^\]]+)\]\s*$", line)
+    if match:
+        sections.add(match.group(1))
+
+missing_sections = [section for section in ("node", "network") if section not in sections]
+if missing_sections:
+    raise SystemExit(
+        "config.toml is missing required section(s): "
+        + ", ".join(f"[{section}]" for section in missing_sections)
+    )
+
+invalid_lines = []
+bracket_balance = 0
+for line_number, line in enumerate(lines, 1):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+
+    if bracket_balance > 0:
+        bracket_balance += stripped.count("[") - stripped.count("]")
+        continue
+
+    if re.match(r"\[[^\]]+\]$", stripped):
+        continue
+
+    if re.match(r"[A-Za-z0-9_.-]+\s*=", stripped):
+        value = stripped.split("=", 1)[1]
+        bracket_balance += value.count("[") - value.count("]")
+        continue
+
+    invalid_lines.append((line_number, stripped))
+    if len(invalid_lines) >= 5:
+        break
+
+if invalid_lines:
+    message = [
+        "config.toml looks corrupted. Some comment/prose lines are not prefixed with '#'.",
+        "Restore a clean Casper config.toml before running snapshot restore.",
+        "First suspicious line(s):",
+    ]
+    message.extend(f"  line {number}: {text}" for number, text in invalid_lines)
+    raise SystemExit("\n".join(message))
+PY
+
+  ok "Config health check passed"
 }
 
 watch_initial_progress() {
@@ -441,7 +535,7 @@ if [[ "$USE_DEFAULT_PEERS" == "true" ]]; then
   fi
 fi
 if [[ "$WATCH_SECONDS" -eq 0 ]]; then
-  TOTAL_STEPS=11
+  TOTAL_STEPS=12
 fi
 
 SNAPSHOT_URL="${SNAPSHOT_URL:-${SNAPSHOT_URL:-}}"
@@ -498,7 +592,11 @@ step "Install required tools"
 info "Installing aria2, lz4, jq, curl, python3 and tar if needed"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 lz4 jq curl ca-certificates tar grep sed coreutils python3
+command -v casper-client >/dev/null || fail "casper-client is required. Install Casper node packages before running this restore script."
 ok "Required tools are ready"
+
+step "Check config health"
+check_config_health
 import_known_peers_from_source
 
 SNAPSHOT_FILE="${SNAPSHOT_URL##*/}"
