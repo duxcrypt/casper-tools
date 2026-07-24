@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SNAPSHOT_URL=""
+SNAPSHOT_URL="${SNAPSHOT_URL:-}"
 LATEST="false"
 PRINT_LATEST="false"
-SNAPSHOT_INDEX_URL="https://snapshot.kalia.network/"
-CASPER_VERSION="2_2_2"
-RPC_URL="https://node.testnet.casper.network/rpc"
+SNAPSHOT_INDEX_URL="${SNAPSHOT_INDEX_URL:-https://snapshot.kalia.network/}"
+CASPER_VERSION="${CASPER_VERSION:-2_2_2}"
+RPC_URL="${RPC_URL:-https://node.testnet.casper.network/rpc}"
 YES="false"
 KEEP_ARCHIVE="false"
+SKIP_STORAGE_CHECK="false"
 DOWNLOAD_DIR="${HOME}"
 CASPER_DATA_DIR="/var/lib/casper/casper-node"
 CASPER_BASE_DIR="/var/lib/casper"
@@ -30,7 +31,7 @@ BLOCK_HEIGHT=""
 TRUSTED_HASH_DEPTH=0
 TRUSTED_HASH_HEIGHT=""
 STALE_SNAPSHOT_WARN_BLOCKS=5000
-TOTAL_STEPS=14
+TOTAL_STEPS=15
 CURRENT_STEP=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -84,6 +85,9 @@ Options:
   --watch-seconds N Watch initial node progress after start. Default: 300.
   --no-watch        Do not watch initial node progress after start.
   --keep-archive    Do not delete downloaded snapshot archive after restore.
+  --skip-storage-check
+                    Allow execution on Btrfs or loop-backed root storage.
+                    Not recommended for Casper LMDB.
   --yes             Run without interactive confirmation.
   -h, --help        Show this help.
 
@@ -100,6 +104,8 @@ Default peer behavior:
 
 This script removes only /var/lib/casper/casper-node.
 It does not remove /etc/casper/validator_keys.
+It refuses Btrfs and loop-backed root storage by default because these
+storage layers can make Casper LMDB stall on fsync.
 EOF
 }
 
@@ -134,6 +140,30 @@ warn() {
 fail() {
   printf '\n%sERROR%s %s\n' "$RED" "$RESET" "$*" >&2
   exit 1
+}
+
+check_storage_health() {
+  command -v findmnt >/dev/null || fail "findmnt is required for the storage safety check."
+
+  local root_source root_fstype
+  root_source="$(findmnt -n -o SOURCE /)"
+  root_fstype="$(findmnt -n -o FSTYPE /)"
+
+  info "Root storage: ${root_source} (${root_fstype})"
+
+  if [[ "$SKIP_STORAGE_CHECK" == "true" ]]; then
+    warn "Storage safety check was explicitly skipped."
+    return 0
+  fi
+
+  if [[ "$root_fstype" == "btrfs" || "$root_source" == /dev/loop* ]]; then
+    fail "Unsafe Casper storage detected: ${root_source} (${root_fstype}).
+Casper LMDB can stall on fsync when the container root uses Btrfs or a loop-backed pool.
+Create or migrate the container to a direct ext4/LVM-backed LXD pool, then run this script again.
+Use --skip-storage-check only when you understand and accept this risk."
+  fi
+
+  ok "Storage preflight passed"
 }
 
 show_plan() {
@@ -171,6 +201,7 @@ show_plan() {
   printf '  Sync handling  : %s\n' "$SYNC_HANDLING"
   printf '  Idle tolerance : %s\n' "$IDLE_TOLERANCE"
   printf '  Max attempts   : %s\n' "$MAX_ATTEMPTS"
+  printf '  Root storage   : %s (%s)\n' "$(findmnt -n -o SOURCE /)" "$(findmnt -n -o FSTYPE /)"
   line
 }
 
@@ -566,6 +597,10 @@ while [[ $# -gt 0 ]]; do
       KEEP_ARCHIVE="true"
       shift
       ;;
+    --skip-storage-check)
+      SKIP_STORAGE_CHECK="true"
+      shift
+      ;;
     --yes|-y)
       YES="true"
       shift
@@ -593,13 +628,9 @@ if [[ "$USE_DEFAULT_PEERS" == "true" ]]; then
   fi
 fi
 if [[ "$WATCH_SECONDS" -eq 0 ]]; then
-  TOTAL_STEPS=13
+  TOTAL_STEPS=14
 fi
 
-SNAPSHOT_URL="${SNAPSHOT_URL:-${SNAPSHOT_URL:-}}"
-SNAPSHOT_INDEX_URL="${SNAPSHOT_INDEX_URL:-https://snapshot.kalia.network/}"
-CASPER_VERSION="${CASPER_VERSION:-2_2_2}"
-RPC_URL="${RPC_URL:-https://node.testnet.casper.network/rpc}"
 CONFIG_FILE="/etc/casper/${CASPER_VERSION}/config.toml"
 STARTED_AT="$(date +%s)"
 
@@ -645,6 +676,7 @@ fi
 step "Check node files"
 ok "Config found: $CONFIG_FILE"
 ok "Validator keys found: $VALIDATOR_KEYS_DIR"
+check_storage_health
 
 step "Install required tools"
 info "Installing aria2, lz4, jq, curl, python3 and tar if needed"
@@ -684,6 +716,11 @@ aria2c \
 
 [[ -s "$SNAPSHOT_PATH" ]] || fail "Snapshot download failed or file is empty: $SNAPSHOT_PATH"
 ok "Snapshot archive is ready: $SNAPSHOT_PATH"
+
+step "Validate snapshot archive"
+info "Testing the complete LZ4 stream and tar structure before changing the current database"
+lz4 -d -c "$SNAPSHOT_PATH" | tar -t >/dev/null
+ok "Snapshot archive integrity check passed"
 
 step "Stop Casper services"
 systemctl stop casper-node-launcher casper-sidecar 2>/dev/null || true
@@ -789,6 +826,8 @@ update_known_peers
 update_node_sync_settings
 
 step "Start services and show status"
+systemctl enable casper-node-launcher
+systemctl enable casper-sidecar 2>/dev/null || true
 systemctl start casper-node-launcher
 systemctl start casper-sidecar 2>/dev/null || true
 sleep 10
