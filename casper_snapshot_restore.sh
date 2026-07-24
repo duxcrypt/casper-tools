@@ -13,6 +13,10 @@ DOWNLOAD_DIR="${HOME}"
 CASPER_DATA_DIR="/var/lib/casper/casper-node"
 CASPER_BASE_DIR="/var/lib/casper"
 VALIDATOR_KEYS_DIR="/etc/casper/validator_keys"
+UNIT_FILES_DIR="${CASPER_DATA_DIR}/casper-test/unit_files"
+SYNC_HANDLING="ttl"
+IDLE_TOLERANCE="5 minutes"
+MAX_ATTEMPTS=100
 WATCH_SECONDS=300
 WATCH_INTERVAL=30
 DEFAULT_KNOWN_PEER="135.181.17.229:35000"
@@ -26,7 +30,7 @@ BLOCK_HEIGHT=""
 TRUSTED_HASH_DEPTH=0
 TRUSTED_HASH_HEIGHT=""
 STALE_SNAPSHOT_WARN_BLOCKS=5000
-TOTAL_STEPS=13
+TOTAL_STEPS=14
 CURRENT_STEP=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -164,6 +168,9 @@ show_plan() {
   fi
   printf '  Will remove    : %s\n' "$CASPER_DATA_DIR"
   printf '  Will keep      : %s\n' "$VALIDATOR_KEYS_DIR"
+  printf '  Sync handling  : %s\n' "$SYNC_HANDLING"
+  printf '  Idle tolerance : %s\n' "$IDLE_TOLERANCE"
+  printf '  Max attempts   : %s\n' "$MAX_ATTEMPTS"
   line
 }
 
@@ -296,6 +303,57 @@ config_path.write_text("\n".join(lines) + "\n")
 PY
 
   ok "trusted_hash updated: $BLOCK_HASH"
+}
+
+update_node_sync_settings() {
+  command -v python3 >/dev/null || fail "python3 is required to edit node sync settings safely."
+
+  CONFIG_FILE="$CONFIG_FILE" \
+  SYNC_HANDLING="$SYNC_HANDLING" \
+  IDLE_TOLERANCE="$IDLE_TOLERANCE" \
+  MAX_ATTEMPTS="$MAX_ATTEMPTS" \
+  python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+config_path = Path(os.environ["CONFIG_FILE"])
+lines = config_path.read_text().splitlines()
+
+node_start = None
+node_end = len(lines)
+for index, line in enumerate(lines):
+    if re.match(r"\s*\[node\]\s*$", line):
+        node_start = index
+        continue
+    if node_start is not None and index > node_start and re.match(r"\s*\[[^\]]+\]\s*$", line):
+        node_end = index
+        break
+
+if node_start is None:
+    raise SystemExit("Could not find [node] section in config.toml")
+
+settings = {
+    "sync_handling": f"'{os.environ['SYNC_HANDLING']}'",
+    "idle_tolerance": f"'{os.environ['IDLE_TOLERANCE']}'",
+    "max_attempts": os.environ["MAX_ATTEMPTS"],
+}
+
+for key, value in settings.items():
+    replacement = f"{key} = {value}"
+    for index in range(node_start + 1, node_end):
+        if re.match(rf"\s*#?\s*{re.escape(key)}\s*=", lines[index]):
+            indent = re.match(r"^(\s*)", lines[index]).group(1)
+            lines[index] = indent + replacement
+            break
+    else:
+        lines.insert(node_start + 1, replacement)
+        node_end += 1
+
+config_path.write_text("\n".join(lines) + "\n")
+PY
+
+  ok "Node sync settings updated: ${SYNC_HANDLING}, ${IDLE_TOLERANCE}, ${MAX_ATTEMPTS} attempts"
 }
 
 check_config_health() {
@@ -535,7 +593,7 @@ if [[ "$USE_DEFAULT_PEERS" == "true" ]]; then
   fi
 fi
 if [[ "$WATCH_SECONDS" -eq 0 ]]; then
-  TOTAL_STEPS=12
+  TOTAL_STEPS=13
 fi
 
 SNAPSHOT_URL="${SNAPSHOT_URL:-${SNAPSHOT_URL:-}}"
@@ -649,6 +707,11 @@ lz4 -d -c "$SNAPSHOT_PATH" | tar -x -C "$CASPER_BASE_DIR"
 [[ -d "$CASPER_DATA_DIR" ]] || fail "Snapshot did not create expected directory: $CASPER_DATA_DIR"
 ok "Snapshot extracted"
 
+step "Reset transient consensus cache"
+mkdir -p "$UNIT_FILES_DIR"
+find "$UNIT_FILES_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+ok "Transient unit_files cache reset: $UNIT_FILES_DIR"
+
 step "Fix permissions"
 chown -R casper:casper "$CASPER_DATA_DIR"
 if [[ -x /etc/casper/node_util.py ]]; then
@@ -723,6 +786,7 @@ fi
 
 update_trusted_hash
 update_known_peers
+update_node_sync_settings
 
 step "Start services and show status"
 systemctl start casper-node-launcher
